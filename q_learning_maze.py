@@ -7,6 +7,7 @@ import random
 ROWS = 4
 COLS = 4
 
+
 START = (0, 0)
 GOAL = (3, 3)
 
