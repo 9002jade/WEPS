@@ -1,0 +1,184 @@
+"""단일 교차로 신호 제어 환경 (팀 공용 모듈).
+
+Q-learning, DQN 등 어떤 에이전트든 아래 Gym 스타일 인터페이스만 따르면 이 환경으로
+학습할 수 있다: `env.reset()` -> state, `env.step(action)` -> (state, reward, done, info)
+
+state  = (남북 대기차량수, 동서 대기차량수, 현재 페이즈 인덱스, 현재 페이즈 유지시간)
+action = 0(stay, 현재 페이즈 유지) / 1(switch, 다음 페이즈로 전환. 최소 유지시간 미만이면 무시됨)
+reward = -(총 대기차량 증가분) - switch_penalty * (전환 여부)
+
+페이즈는 남북 직진 -> 동서 직진 -> 남북 좌회전 -> 동서 좌회전 순으로 순환하며,
+각 페이즈는 해당 이동류(직진/좌회전)의 대기열만 통과시킨다. 우회전은 신호와 무관하게
+항상 통과 가능하다고 가정해 별도 대기열로 관리하지 않는다.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+
+PHASES = ["남북 직진", "동서 직진", "남북 좌회전", "동서 좌회전"]
+PHASE_NS_STRAIGHT, PHASE_EW_STRAIGHT, PHASE_NS_LEFT, PHASE_EW_LEFT = range(4)
+
+MIN_GREEN_TIME = 15          # 최소 초록불 유지 시간(초)
+MAX_CYCLE_TIME = 120         # 전체 신호 주기 최대(초)
+PASS_RATE_PER_SEC = 0.5      # 초록불일 때 초당 통과 가능 대수
+
+# 방향별 이동류 비율 (직진 / 좌회전 / 우회전)
+STRAIGHT_RATIO = 0.34
+LEFT_RATIO = 0.33
+RIGHT_RATIO = 0.33  # 우회전은 신호 무관 상시 통과 -> 대기열에 넣지 않음
+
+STAY, SWITCH = 0, 1
+N_ACTIONS = 2
+
+# 교통량 프리셋: 방향별(남북/동서) 차량 도착 확률(초당)
+PRESETS = {
+    "normal": {"arrival_prob": 0.30},
+    "rush_hour": {"arrival_prob": 0.55},
+    "night": {"arrival_prob": 0.10},
+}
+
+
+@dataclass
+class StepInfo:
+    switched: bool
+    total_queue: int
+    ns_queue: int
+    ew_queue: int
+
+
+class CrosswayEnvironment:
+    """단일 4방향 교차로 신호 제어 환경."""
+
+    def __init__(self, preset: str = "normal", switch_penalty: float = 2.0,
+                 seed: int | None = None):
+        if preset not in PRESETS:
+            raise ValueError(f"알 수 없는 preset: {preset!r} (사용 가능: {list(PRESETS)})")
+
+        self.preset = preset
+        self.arrival_prob = PRESETS[preset]["arrival_prob"]
+        self.switch_penalty = switch_penalty
+        self.rng = random.Random(seed)
+
+        # 이동류별 대기열 (신호가 관장하는 4개)
+        self.ns_straight = 0
+        self.ns_left = 0
+        self.ew_straight = 0
+        self.ew_left = 0
+
+        self.phase = PHASE_NS_STRAIGHT
+        self.phase_time = 0
+        self.cycle_time = 0
+
+        self.reset()
+
+    def reset(self):
+        self.ns_straight = 0
+        self.ns_left = 0
+        self.ew_straight = 0
+        self.ew_left = 0
+        self.phase = PHASE_NS_STRAIGHT
+        self.phase_time = 0
+        self.cycle_time = 0
+        return self._get_state()
+
+    @property
+    def ns_queue(self) -> int:
+        return self.ns_straight + self.ns_left
+
+    @property
+    def ew_queue(self) -> int:
+        return self.ew_straight + self.ew_left
+
+    def _get_state(self):
+        return (self.ns_queue, self.ew_queue, self.phase, self.phase_time)
+
+    def _spawn_vehicles(self):
+        for direction in ("ns", "ew"):
+            if self.rng.random() >= self.arrival_prob:
+                continue
+            r = self.rng.random()
+            if r < STRAIGHT_RATIO:
+                movement = "straight"
+            elif r < STRAIGHT_RATIO + LEFT_RATIO:
+                movement = "left"
+            else:
+                continue  # 우회전: 대기열 없이 즉시 통과 처리
+
+            if direction == "ns" and movement == "straight":
+                self.ns_straight += 1
+            elif direction == "ns" and movement == "left":
+                self.ns_left += 1
+            elif direction == "ew" and movement == "straight":
+                self.ew_straight += 1
+            else:
+                self.ew_left += 1
+
+    def _discharge_vehicles(self):
+        # 현재 초록불인 이동류의 대기열만 통과시킨다.
+        if self.phase == PHASE_NS_STRAIGHT:
+            passed = min(self.ns_straight, PASS_RATE_PER_SEC)
+            self.ns_straight -= passed
+        elif self.phase == PHASE_EW_STRAIGHT:
+            passed = min(self.ew_straight, PASS_RATE_PER_SEC)
+            self.ew_straight -= passed
+        elif self.phase == PHASE_NS_LEFT:
+            passed = min(self.ns_left, PASS_RATE_PER_SEC)
+            self.ns_left -= passed
+        else:  # PHASE_EW_LEFT
+            passed = min(self.ew_left, PASS_RATE_PER_SEC)
+            self.ew_left -= passed
+
+    def step(self, action: int):
+        if action not in (STAY, SWITCH):
+            raise ValueError(f"알 수 없는 action: {action!r} (0=stay, 1=switch만 허용)")
+
+        prev_total_queue = self.ns_queue + self.ew_queue
+
+        switched = False
+        can_switch = self.phase_time >= MIN_GREEN_TIME
+        if action == SWITCH and can_switch:
+            self.phase = (self.phase + 1) % len(PHASES)
+            self.phase_time = 0
+            switched = True
+        else:
+            self.phase_time += 1
+
+        self._spawn_vehicles()
+        self._discharge_vehicles()
+        self.cycle_time += 1
+
+        new_total_queue = self.ns_queue + self.ew_queue
+        reward = -(new_total_queue - prev_total_queue) - self.switch_penalty * switched
+
+        done = self.cycle_time >= MAX_CYCLE_TIME
+        info = StepInfo(
+            switched=switched,
+            total_queue=new_total_queue,
+            ns_queue=self.ns_queue,
+            ew_queue=self.ew_queue,
+        )
+        return self._get_state(), reward, done, info
+
+    def phase_name(self) -> str:
+        return PHASES[self.phase]
+
+    def __repr__(self):
+        return (f"CrosswayEnvironment(preset={self.preset!r}, phase={self.phase_name()!r}, "
+                f"ns_queue={self.ns_queue}, ew_queue={self.ew_queue}, t={self.cycle_time})")
+
+
+if __name__ == "__main__":
+    # 랜덤 정책으로 한 episode 굴려보고 환경이 정상 동작하는지 확인.
+    env = CrosswayEnvironment(preset="rush_hour", seed=0)
+    state = env.reset()
+    total_reward = 0.0
+    done = False
+    while not done:
+        action = env.rng.choice([STAY, SWITCH])
+        state, reward, done, info = env.step(action)
+        total_reward += reward
+
+    print(env)
+    print(f"랜덤 정책 episode 총 reward: {total_reward:.1f}")
