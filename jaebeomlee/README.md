@@ -12,11 +12,15 @@
 Python 3.10 이상이 필요하다. ([python.org](https://www.python.org/downloads/)에서 설치,
 설치 화면에서 **"Add Python to PATH"** 체크할 것)
 
-프로젝트 폴더에서 터미널(PowerShell)을 열고:
+저장소를 받고 이 폴더로 이동한다:
 
 ```bash
+git clone https://github.com/9002jade/WEPS.git
+cd WEPS/jaebeomlee
 pip install -r requirements.txt
 ```
+
+> 아래 모든 명령은 `WEPS/jaebeomlee` 폴더 안에서 실행한다.
 
 > tkinter(시각화용)는 Python에 기본 포함이라 따로 설치하지 않아도 된다.
 
