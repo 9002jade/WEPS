@@ -5,3 +5,6 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# API 키 등 비밀값. 이 저장소는 공개되어 있으므로 절대 올리지 않는다.
+.env

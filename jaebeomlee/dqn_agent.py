@@ -13,12 +13,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-STATE_DIM = 4  # ns_queue, ew_queue, phase, phase_time
 N_ACTIONS = 2  # 0: stay, 1: switch
 
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS, hidden=64):
+    def __init__(self, state_dim, n_actions=N_ACTIONS, hidden=64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden),
@@ -55,17 +54,20 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def _normalize(state):
-    ns_q, ew_q, phase, phase_time = state
-    return [ns_q / 20.0, ew_q / 20.0, phase / 3.0, phase_time / 120.0]
-
-
 class DQNAgent:
+    """
+    env를 넘기면 상태 크기(env.state_dim)와 정규화 방법(env.normalize_state)을 환경에서 가져온다.
+    환경의 state_mode를 바꿔도 에이전트 코드는 고칠 필요가 없다.
+    """
+
     # gamma=0.9는 1초 스텝에서 약 10초 앞만 내다본다. 신호 한 주기가 60~120초이므로
     # 그 정도 시야가 확보되도록 0.99(≈100초)를 쓴다.
-    def __init__(self, lr=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05,
+    def __init__(self, env, lr=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.05,
                  epsilon_decay_episodes=200, batch_size=64, buffer_size=10_000,
                  target_update_every=100, seed=None):
+        self.state_dim = env.state_dim
+        self.state_mode = env.config.state_mode
+        self._normalize = env.normalize_state
         self.gamma = gamma
         self.epsilon = epsilon_start
         self.epsilon_start = epsilon_start
@@ -75,8 +77,8 @@ class DQNAgent:
         self.target_update_every = target_update_every
         self.rng = random.Random(seed)
 
-        self.policy_net = QNetwork()
-        self.target_net = QNetwork()
+        self.policy_net = QNetwork(self.state_dim)
+        self.target_net = QNetwork(self.state_dim)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -88,12 +90,13 @@ class DQNAgent:
         if not greedy and self.rng.random() < self.epsilon:
             return self.rng.randrange(N_ACTIONS)
         with torch.no_grad():
-            state_t = torch.tensor([_normalize(state)], dtype=torch.float32)
+            state_t = torch.tensor([self._normalize(state)], dtype=torch.float32)
             q_values = self.policy_net(state_t)
             return int(torch.argmax(q_values, dim=1).item())
 
     def store(self, state, action, reward, next_state, done):
-        self.replay_buffer.push(_normalize(state), action, reward, _normalize(next_state), done)
+        self.replay_buffer.push(self._normalize(state), action, reward,
+                                self._normalize(next_state), done)
 
     def learn(self):
         if len(self.replay_buffer) < self.batch_size:
@@ -129,19 +132,28 @@ class DQNAgent:
     def save(self, path):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.policy_net.state_dict(), path)
+        # 상태 형식을 함께 저장해 두면, 다른 형식의 환경에서 불러올 때 바로 알아챌 수 있다.
+        torch.save({"state_dict": self.policy_net.state_dict(),
+                    "state_dim": self.state_dim,
+                    "state_mode": self.state_mode}, path)
 
     def load(self, path):
-        state_dict = torch.load(Path(path), map_location="cpu")
-        self.policy_net.load_state_dict(state_dict)
-        self.target_net.load_state_dict(state_dict)
+        checkpoint = torch.load(Path(path), map_location="cpu")
+        if "state_dict" not in checkpoint:
+            raise ValueError(f"{path}는 상태 4개짜리 예전 형식 모델입니다. "
+                             f"'python train_dqn.py'로 다시 학습하세요.")
+        if checkpoint["state_dim"] != self.state_dim:
+            raise ValueError(f"{path}는 상태 {checkpoint['state_dim']}개({checkpoint['state_mode']}) "
+                             f"모델인데, 지금 환경은 상태 {self.state_dim}개({self.state_mode})입니다.")
+        self.policy_net.load_state_dict(checkpoint["state_dict"])
+        self.target_net.load_state_dict(checkpoint["state_dict"])
         self.policy_net.eval()
         self.epsilon = 0.0  # 불러온 모델은 탐험 없이 greedy하게 사용
         return self
 
 
 def train(env, episodes=300, verbose_every=20):
-    agent = DQNAgent()
+    agent = DQNAgent(env)
     episode_rewards = []
 
     for ep in range(episodes):

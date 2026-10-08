@@ -9,7 +9,7 @@ from collections import defaultdict
 
 import numpy as np
 
-QUEUE_BUCKETS = [0, 2, 5, 10, 20]  # 대기차량수 구간 경계
+QUEUE_BUCKETS = [0, 2, 5, 10, 20]  # 대기차량수 구간 경계 (이동류 하나당)
 # 페이즈 유지시간은 MAX_GREEN_TIME(30초)에서 강제 전환되므로 그 안에서 잘게 나눈다.
 # 최소 초록시간 15초 전후를 구분하는 게 핵심 (그 전에는 전환 자체가 불가능).
 TIME_BUCKETS = [5, 10, 14, 17, 20, 25]
@@ -38,12 +38,13 @@ class QLearningAgent:
         self.q_table = defaultdict(lambda: np.zeros(N_ACTIONS))
 
     def discretize(self, state):
-        ns_q, ew_q, phase, phase_time = state
+        # 상태의 앞부분은 대기열(8개 또는 2개), 끝의 두 값은 페이즈와 유지시간이다.
+        # 대기열 8개를 각각 6구간으로 나누면 조합이 6^8 ≈ 168만 개라 Q-table이 매우 커진다.
+        # 이것이 상태공간이 커질 때 Q-learning이 불리해지는 이유다.
+        *queues, phase, phase_time = state
         return (
-            _bucketize(ns_q, QUEUE_BUCKETS),
-            _bucketize(ew_q, QUEUE_BUCKETS),
-            phase,
-            _bucketize(phase_time, TIME_BUCKETS),
+            tuple(_bucketize(q, QUEUE_BUCKETS) for q in queues)
+            + (phase, _bucketize(phase_time, TIME_BUCKETS))
         )
 
     def select_action(self, state, greedy=False):

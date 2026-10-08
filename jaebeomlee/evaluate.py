@@ -2,7 +2,7 @@
 
 측정 지표 (연구계획서 6절):
   1. 평균 대기열 길이
-  2. 평균 차량 대기 시간 (Little's Law: 평균 대기열 / 분당 처리량)
+  2. 평균 차량 대기 시간 (차마다 '통과 시각 - 도착 시각'을 직접 잰 평균, 우회전 제외)
   3. 차량 통과량 (분당)
   4. 신호 전환 횟수
 
@@ -19,7 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
-from crossway_environment import MIN_GREEN_TIME, STAY, SWITCH, CrosswayEnvironment
+from crossway_environment import STAY, SWITCH, CrosswayEnvironment
+from env_config import PRESETS, skewed_demand
 
 RESULTS_DIR = Path(__file__).parent / "results"
 EVAL_EPISODES = 60
@@ -45,9 +46,7 @@ def evaluate(policy, preset="normal", episodes=EVAL_EPISODES, skew=1.0):
 
     for ep in range(episodes):
         env = CrosswayEnvironment(preset=preset, seed=EVAL_SEED_BASE + ep)
-        base = env.arrival_prob
-        env.arrival_prob_ns = min(base * skew, 1.0)
-        env.arrival_prob_ew = min(base * (2.0 - skew), 1.0)
+        env.arrival_per_hour = skewed_demand(env.arrival_per_hour, skew)
         state = env.reset()
         queue_samples, n_switch = [], 0
         done = False
@@ -63,8 +62,7 @@ def evaluate(policy, preset="normal", episodes=EVAL_EPISODES, skew=1.0):
         avg_queues.append(avg_queue)
         throughputs.append(per_min)
         switches.append(n_switch)
-        # Little's Law: 평균 대기시간 = 평균 대기열 / 처리율
-        wait_times.append(avg_queue / (per_min / 60) if per_min > 0 else float("inf"))
+        wait_times.append(env.avg_wait)
 
     return {
         "평균_대기열": float(np.mean(avg_queues)),
@@ -76,9 +74,11 @@ def evaluate(policy, preset="normal", episodes=EVAL_EPISODES, skew=1.0):
 
 def main():
     parser = argparse.ArgumentParser(description="교차로 신호 제어 성능 평가")
-    parser.add_argument("--preset", default="normal", choices=["normal", "rush_hour", "night"])
+    parser.add_argument("--preset", default="normal", choices=list(PRESETS))
     parser.add_argument("--model", default=None)
     args = parser.parse_args()
+    # DQN의 상태 크기를 환경에서 가져오기 위해 같은 프리셋의 환경을 하나 만든다.
+    reference_env = CrosswayEnvironment(preset=args.preset)
 
     policies = {
         "고정주기 15초": fixed_time_policy(15),
@@ -89,7 +89,7 @@ def main():
     model_path = Path(args.model) if args.model else RESULTS_DIR / f"dqn_{args.preset}.pt"
     if model_path.exists():
         from dqn_agent import DQNAgent
-        policies["DQN"] = dqn_policy(DQNAgent().load(model_path))
+        policies["DQN"] = dqn_policy(DQNAgent(reference_env).load(model_path))
     else:
         print(f"[경고] 모델 없음: {model_path} — 기준선만 평가합니다.")
 
